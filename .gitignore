@@ -1,0 +1,25 @@
+# Build artefacts
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Editor / IDE
+.vs/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary build output
+cl_stdout.txt
+cl_stderr.txt
+rc_stdout.txt
+rc_stderr.txt
+
+# OS
+Thumbs.db
+Desktop.ini

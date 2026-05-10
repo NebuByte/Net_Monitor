@@ -1,0 +1,40 @@
+#include <winver.h>
+
+/* ── Version Info ──────────────────────────────────────────────────────────
+   Embedded in the PE so AV scanners, Windows Explorer "Details" tab, and
+   Task Manager all see legitimate product metadata.                       */
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1, 0, 0, 0
+PRODUCTVERSION  1, 0, 0, 0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"          /* US English, Unicode */
+        BEGIN
+            VALUE "CompanyName",      "Ibrahim Mohammed"
+            VALUE "FileDescription",  "Network Monitor - System Tray Widget"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "netmon"
+            VALUE "LegalCopyright",   "\251 2026 Ibrahim Mohammed. All rights reserved."
+            VALUE "OriginalFilename", "netmon.exe"
+            VALUE "ProductName",      "NetMon"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+/* ── Application Manifest ─────────────────────────────────────────────────
+   Declares: no admin required, DPI-aware, Windows 10/11 support, UTF-8.
+   Prevents UAC elevation prompts and tells the OS this is a well-behaved app. */
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "netmon.manifest"
