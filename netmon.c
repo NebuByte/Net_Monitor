@@ -71,16 +71,20 @@
 #define C_DHCP  RGB(100, 180, 240)
 #define C_STAT  RGB(200, 160,  60)
 
-/* ── Layout ─────────────────────────────────────────────────────────────── */
-#define WW        400
-#define HPAD       14
-#define HDR_H      56
-#define CARD_H    150    /* taller to fit icon + 7 rows (adds gateway/throughput) */
-#define CARD_GAP    8
-#define BPAD        8
-#define ICON_SZ    18    /* connection type icon size */
-#define BTN_SZ     26    /* minimize button (square) */
-#define TOGGLE_H   34    /* show/hide-disabled button height */
+/* ── Layout ──────────────────────────────────────────────────────────────────
+   All geometry is authored at 96 DPI (100% scale). DPS() scales any pixel
+   value to the widget's current DPI (g_dpi) so the layout grows in lockstep
+   with the fonts on high-DPI / scaled displays — no clipping, stays crisp.   */
+#define DPS(x)    MulDiv((x), g_dpi, 96)
+#define WW        DPS(400)
+#define HPAD      DPS(14)
+#define HDR_H     DPS(56)
+#define CARD_H    DPS(150)   /* fits icon + 7 rows (name, type, ip, mask, gw, dns, mac) */
+#define CARD_GAP  DPS(8)
+#define BPAD      DPS(8)
+#define ICON_SZ   DPS(18)    /* connection type icon size */
+#define BTN_SZ    DPS(26)    /* minimize button (square) */
+#define TOGGLE_H  DPS(34)    /* show/hide-disabled button height */
 
 /* ── Adapter state ──────────────────────────────────────────────────────── */
 #define STATE_UP       0   /* connected, operational */
@@ -131,6 +135,7 @@ static UINT            g_wmTaskbar;
 static WCHAR           g_publicIp[64] = {0};
 static volatile LONG   g_pubIpFetching = 0;
 static ULONGLONG       g_lastSampleMs = 0;
+static UINT            g_dpi          = 96;   /* widget render DPI; set on create + WM_DPICHANGED */
 
 /* ── Prototypes ─────────────────────────────────────────────────────────── */
 static LRESULT CALLBACK MainProc  (HWND, UINT, WPARAM, LPARAM);
@@ -738,7 +743,7 @@ static int CalcWidgetH(void)
 {
     RECT work;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    int maxH    = (work.bottom - work.top) - 40;
+    int maxH    = (work.bottom - work.top) - DPS(40);
     int content = ContentHeight();
     return content < maxH ? content : maxH;
 }
@@ -760,10 +765,10 @@ static void PositionWidget(void)
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int wh = CalcWidgetH();
     ClampScroll();
-    int x  = work.right  - WW - 12;
-    int y  = work.bottom - wh - 8;
-    if (x < work.left) x = work.left + 12;
-    if (y < work.top)  y = work.top  + 8;
+    int x  = work.right  - WW - DPS(12);
+    int y  = work.bottom - wh - DPS(8);
+    if (x < work.left) x = work.left + DPS(12);
+    if (y < work.top)  y = work.top  + DPS(8);
     SetWindowPos(g_hWid, HWND_TOPMOST, x, y, WW, wh, SWP_NOACTIVATE);
 }
 
@@ -811,9 +816,8 @@ static void ToggleWidget(void)
    ══════════════════════════════════════════════════════════════════════════ */
 static HFONT MakeFont(int pt10, int weight, const WCHAR *face)
 {
-    HDC dc = GetDC(NULL);
-    int h  = -MulDiv(pt10, GetDeviceCaps(dc, LOGPIXELSY), 720);
-    ReleaseDC(NULL, dc);
+    /* Scale by the same g_dpi the layout uses so fonts and geometry stay in sync. */
+    int h = -MulDiv(pt10, g_dpi, 720);
     return CreateFontW(h, 0, 0, 0, weight, 0, 0, 0,
                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
@@ -909,9 +913,12 @@ static void DrawConnectionIcon(HDC dc, int ix, int iy, DWORD type, BOOL up, int 
     COLORREF col    = up ? C_UP : RGB(100, 100, 120);
     COLORREF dimCol = RGB(60, 62, 80);
 
+    int pen = DPS(2); if (pen < 1) pen = 1;
+
     if (type == IF_TYPE_IEEE80211) {
         int cx = ix + ICON_SZ / 2;
-        int cy = iy + ICON_SZ - 2;
+        int cy = iy + ICON_SZ - DPS(2);
+        int rO = DPS(9), rM = DPS(6), rI = DPS(3);
 
         /* Number of "lit" arcs based on signal strength (0-3).
            Unlit arcs drawn in dim colour so the icon stays readable. */
@@ -922,24 +929,24 @@ static void DrawConnectionIcon(HDC dc, int ix, int iy, DWORD type, BOOL up, int 
 
         HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
 
-        /* outer r=9 */
-        HPEN pOut = CreatePen(PS_SOLID, 2, lit >= 3 ? col : dimCol);
+        /* outer arc */
+        HPEN pOut = CreatePen(PS_SOLID, pen, lit >= 3 ? col : dimCol);
         HPEN op   = (HPEN)SelectObject(dc, pOut);
-        Arc(dc, cx-9, cy-9, cx+9, cy+9,  cx+9, cy,  cx-9, cy);
+        Arc(dc, cx-rO, cy-rO, cx+rO, cy+rO,  cx+rO, cy,  cx-rO, cy);
         SelectObject(dc, op);
         DeleteObject(pOut);
 
-        /* middle r=6 */
-        HPEN pMid = CreatePen(PS_SOLID, 2, lit >= 2 ? col : dimCol);
+        /* middle arc */
+        HPEN pMid = CreatePen(PS_SOLID, pen, lit >= 2 ? col : dimCol);
         op = (HPEN)SelectObject(dc, pMid);
-        Arc(dc, cx-6, cy-6, cx+6, cy+6,  cx+6, cy,  cx-6, cy);
+        Arc(dc, cx-rM, cy-rM, cx+rM, cy+rM,  cx+rM, cy,  cx-rM, cy);
         SelectObject(dc, op);
         DeleteObject(pMid);
 
-        /* inner r=3 */
-        HPEN pIn = CreatePen(PS_SOLID, 2, lit >= 1 ? col : dimCol);
+        /* inner arc */
+        HPEN pIn = CreatePen(PS_SOLID, pen, lit >= 1 ? col : dimCol);
         op = (HPEN)SelectObject(dc, pIn);
-        Arc(dc, cx-3, cy-3, cx+3, cy+3,  cx+3, cy,  cx-3, cy);
+        Arc(dc, cx-rI, cy-rI, cx+rI, cy+rI,  cx+rI, cy,  cx-rI, cy);
         SelectObject(dc, op);
         DeleteObject(pIn);
 
@@ -948,30 +955,30 @@ static void DrawConnectionIcon(HDC dc, int ix, int iy, DWORD type, BOOL up, int 
         SelectObject(dc, dotBr);
         HPEN np = (HPEN)GetStockObject(NULL_PEN);
         SelectObject(dc, np);
-        Ellipse(dc, cx-2, cy-2, cx+3, cy+3);
+        Ellipse(dc, cx-DPS(2), cy-DPS(2), cx+DPS(3), cy+DPS(3));
         DeleteObject(dotBr);
 
         SelectObject(dc, ob);
     }
     else if (type == IF_TYPE_ETHERNET_CSMACD) {
         /* Ethernet: [■]──[■]  two small squares joined by a horizontal line */
-        HPEN p1  = CreatePen(PS_SOLID, 1, col);
+        HPEN p1  = CreatePen(PS_SOLID, DPS(1) < 1 ? 1 : DPS(1), col);
         HPEN op  = (HPEN)SelectObject(dc, p1);
         HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
 
         int cy = iy + ICON_SZ / 2;   /* vertical centre */
 
         /* left node */
-        Rectangle(dc, ix + 1, cy - 4, ix + 6, cy + 4);
+        Rectangle(dc, ix + DPS(1), cy - DPS(4), ix + DPS(6), cy + DPS(4));
         /* connecting line */
-        MoveToEx(dc, ix + 6, cy, NULL);
-        LineTo(dc, ix + 12, cy);
+        MoveToEx(dc, ix + DPS(6), cy, NULL);
+        LineTo(dc, ix + DPS(12), cy);
         /* right node */
-        Rectangle(dc, ix + 12, cy - 4, ix + 17, cy + 4);
+        Rectangle(dc, ix + DPS(12), cy - DPS(4), ix + DPS(17), cy + DPS(4));
 
         /* small tick marks on nodes (port indicators) */
-        MoveToEx(dc, ix + 3,  cy - 1, NULL); LineTo(dc, ix + 3,  cy + 1);
-        MoveToEx(dc, ix + 14, cy - 1, NULL); LineTo(dc, ix + 14, cy + 1);
+        MoveToEx(dc, ix + DPS(3),  cy - DPS(1), NULL); LineTo(dc, ix + DPS(3),  cy + DPS(1));
+        MoveToEx(dc, ix + DPS(14), cy - DPS(1), NULL); LineTo(dc, ix + DPS(14), cy + DPS(1));
 
         SelectObject(dc, op);
         SelectObject(dc, ob);
@@ -979,14 +986,14 @@ static void DrawConnectionIcon(HDC dc, int ix, int iy, DWORD type, BOOL up, int 
     }
     else {
         /* Generic: small globe (circle + horizontal equator) */
-        HPEN p1  = CreatePen(PS_SOLID, 1, col);
+        HPEN p1  = CreatePen(PS_SOLID, DPS(1) < 1 ? 1 : DPS(1), col);
         HPEN op  = (HPEN)SelectObject(dc, p1);
         HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
 
-        int cx = ix + ICON_SZ / 2, cy = iy + ICON_SZ / 2;
-        Ellipse(dc, ix + 2, iy + 2, ix + ICON_SZ - 2, iy + ICON_SZ - 2);
-        MoveToEx(dc, ix + 2, cy, NULL);
-        LineTo(dc, ix + ICON_SZ - 2, cy);
+        int cy = iy + ICON_SZ / 2;
+        Ellipse(dc, ix + DPS(2), iy + DPS(2), ix + ICON_SZ - DPS(2), iy + ICON_SZ - DPS(2));
+        MoveToEx(dc, ix + DPS(2), cy, NULL);
+        LineTo(dc, ix + ICON_SZ - DPS(2), cy);
 
         SelectObject(dc, op);
         SelectObject(dc, ob);
@@ -1035,7 +1042,7 @@ static void PaintWidget(HWND hwnd)
     SelectObject(mdc, fHdr);
     SetTextColor(mdc, C_HDR);
     /* title on first half of header */
-    RECT htRc = {HPAD + 4, 4, W - 90, 26};
+    RECT htRc = {HPAD + DPS(4), DPS(4), W - DPS(90), DPS(26)};
     DrawTextW(mdc, L"Network Monitor", -1, &htRc, DT_VCENTER | DT_SINGLELINE);
 
     /* Public IP subtitle on second half of header */
@@ -1046,7 +1053,7 @@ static void PaintWidget(HWND hwnd)
         swprintf(pubStr, 80, L"Public IP:  %s", g_publicIp);
     else
         wcscpy(pubStr, L"Public IP:  …");
-    RECT puRc = {HPAD + 4, 28, W - 12, HDR_H - 4};
+    RECT puRc = {HPAD + DPS(4), DPS(28), W - DPS(12), HDR_H - DPS(4)};
     DrawTextW(mdc, pubStr, -1, &puRc, DT_VCENTER | DT_SINGLELINE);
 
     /* X/Y UP badge — sits just left of the minimize button.
@@ -1060,12 +1067,12 @@ static void PaintWidget(HWND hwnd)
     swprintf(badge, 32, L"%d / %d UP", up, visible);
     SelectObject(mdc, fSub);
     SetTextColor(mdc, up == visible ? C_UP : (up == 0 ? C_DOWN : C_SUB));
-    RECT bdRc = {0, 4, W - 8 - BTN_SZ - 8, 26};
+    RECT bdRc = {0, DPS(4), W - DPS(8) - BTN_SZ - DPS(8), DPS(26)};
     DrawTextW(mdc, badge, -1, &bdRc, DT_VCENTER | DT_SINGLELINE | DT_RIGHT);
 
     /* ── minimize (↓) button ────────────────────────────────────────────── */
-    int bx = W - 8 - BTN_SZ;
-    int by = (30 - BTN_SZ) / 2 + 1;
+    int bx = W - DPS(8) - BTN_SZ;
+    int by = (DPS(30) - BTN_SZ) / 2 + DPS(1);
 
     /* button background */
     COLORREF btnBg = g_btnHover ? RGB(70, 74, 100) : RGB(38, 40, 58);
@@ -1073,7 +1080,7 @@ static void PaintWidget(HWND hwnd)
     HBRUSH oBtnBr = (HBRUSH)SelectObject(mdc, btnBr);
     HPEN btnPen = CreatePen(PS_SOLID, 1, g_btnHover ? RGB(100, 106, 140) : C_EDGE);
     HPEN oBtnPen = (HPEN)SelectObject(mdc, btnPen);
-    RoundRect(mdc, bx, by, bx + BTN_SZ, by + BTN_SZ, 6, 6);
+    RoundRect(mdc, bx, by, bx + BTN_SZ, by + BTN_SZ, DPS(6), DPS(6));
     SelectObject(mdc, oBtnBr);
     SelectObject(mdc, oBtnPen);
     DeleteObject(btnBr);
@@ -1081,13 +1088,13 @@ static void PaintWidget(HWND hwnd)
 
     /* chevron ∨ — two lines meeting at bottom-center of button */
     COLORREF chevCol = g_btnHover ? C_TXT : C_SUB;
-    HPEN chvPen = CreatePen(PS_SOLID, 2, chevCol);
+    HPEN chvPen = CreatePen(PS_SOLID, DPS(2) < 1 ? 1 : DPS(2), chevCol);
     HPEN oChv   = (HPEN)SelectObject(mdc, chvPen);
     int cx = bx + BTN_SZ / 2;
     int cy = by + BTN_SZ / 2;
-    MoveToEx(mdc, cx - 6, cy - 3, NULL);
-    LineTo  (mdc, cx,     cy + 4);
-    LineTo  (mdc, cx + 6, cy - 3);
+    MoveToEx(mdc, cx - DPS(6), cy - DPS(3), NULL);
+    LineTo  (mdc, cx,          cy + DPS(4));
+    LineTo  (mdc, cx + DPS(6), cy - DPS(3));
     SelectObject(mdc, oChv);
     DeleteObject(chvPen);
 
@@ -1125,7 +1132,7 @@ static void PaintWidget(HWND hwnd)
         HBRUSH oBr    = (HBRUSH)SelectObject(mdc, cardBr);
         HPEN   nullP  = (HPEN)GetStockObject(NULL_PEN);
         HPEN   oP     = (HPEN)SelectObject(mdc, nullP);
-        RoundRect(mdc, cr.left, cr.top, cr.right, cr.bottom, 10, 10);
+        RoundRect(mdc, cr.left, cr.top, cr.right, cr.bottom, DPS(10), DPS(10));
         SelectObject(mdc, oP);
         SelectObject(mdc, oBr);
         DeleteObject(cardBr);
@@ -1135,7 +1142,7 @@ static void PaintWidget(HWND hwnd)
         HBRUSH nbBr  = (HBRUSH)GetStockObject(NULL_BRUSH);
         oP  = (HPEN)SelectObject(mdc, bdPen);
         oBr = (HBRUSH)SelectObject(mdc, nbBr);
-        RoundRect(mdc, cr.left, cr.top, cr.right, cr.bottom, 10, 10);
+        RoundRect(mdc, cr.left, cr.top, cr.right, cr.bottom, DPS(10), DPS(10));
         SelectObject(mdc, oP);
         SelectObject(mdc, oBr);
         DeleteObject(bdPen);
@@ -1145,7 +1152,7 @@ static void PaintWidget(HWND hwnd)
                              (a->state == STATE_DOWN)     ? C_DOWN :
                                                             RGB(60, 62, 80);
         HBRUSH stBr = CreateSolidBrush(stripeCol);
-        RECT   stRc = {cr.left, cr.top + 10, cr.left + 3, cr.bottom - 10};
+        RECT   stRc = {cr.left, cr.top + DPS(10), cr.left + DPS(3), cr.bottom - DPS(10)};
         FillRect(mdc, &stRc, stBr);
         DeleteObject(stBr);
 
@@ -1154,14 +1161,14 @@ static void PaintWidget(HWND hwnd)
         COLORREF colSub = dimmed ? RGB(60, 62, 80)  : C_SUB;
 
         /* ── row 1: connection icon + name + status pill ─────────────── */
-        int iconX = cr.left + 10;
-        int iconY = cr.top  + 8;
+        int iconX = cr.left + DPS(10);
+        int iconY = cr.top  + DPS(8);
         DrawConnectionIcon(mdc, iconX, iconY, a->type, a->state == STATE_UP, a->signal);
 
         SelectObject(mdc, fName);
         SetTextColor(mdc, colTxt);
-        RECT nr = {cr.left + 10 + ICON_SZ + 6, cr.top + 9,
-                   cr.right - 106,              cr.top + 27};
+        RECT nr = {cr.left + DPS(10) + ICON_SZ + DPS(6), cr.top + DPS(9),
+                   cr.right - DPS(106),                  cr.top + DPS(27)};
         DrawTextW(mdc, a->name, -1, &nr, DT_SINGLELINE | DT_END_ELLIPSIS);
 
         /* status pill badge */
@@ -1170,9 +1177,9 @@ static void PaintWidget(HWND hwnd)
                                                             L"DISABLED";
         SelectObject(mdc, fSub);
         SIZE stSz; GetTextExtentPoint32W(mdc, stStr, (int)wcslen(stStr), &stSz);
-        int pillW = stSz.cx + 12;
-        int pillX = cr.right - 8 - pillW;
-        int pillY = cr.top + 11;
+        int pillW = stSz.cx + DPS(12);
+        int pillX = cr.right - DPS(8) - pillW;
+        int pillY = cr.top + DPS(11);
         COLORREF pillBg = (a->state == STATE_UP)   ? RGB(20, 60, 35)  :
                           (a->state == STATE_DOWN) ? RGB(65, 22, 22)  :
                                                      RGB(35, 36, 48);
@@ -1180,13 +1187,13 @@ static void PaintWidget(HWND hwnd)
         HBRUSH oPill  = (HBRUSH)SelectObject(mdc, pillBr);
         HPEN pillPen  = CreatePen(PS_SOLID, 1, stripeCol);
         HPEN oPillPen = (HPEN)SelectObject(mdc, pillPen);
-        RoundRect(mdc, pillX, pillY, pillX + pillW, pillY + 16, 8, 8);
+        RoundRect(mdc, pillX, pillY, pillX + pillW, pillY + DPS(16), DPS(8), DPS(8));
         SelectObject(mdc, oPill);
         SelectObject(mdc, oPillPen);
         DeleteObject(pillBr);
         DeleteObject(pillPen);
         SetTextColor(mdc, stripeCol);
-        RECT sr = {pillX, pillY, pillX + pillW, pillY + 16};
+        RECT sr = {pillX, pillY, pillX + pillW, pillY + DPS(16)};
         DrawTextW(mdc, stStr, -1, &sr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
         /* ── row 2: Wi-Fi SSID + signal, or type + description ───────── */
@@ -1207,7 +1214,7 @@ static void PaintWidget(HWND hwnd)
             swprintf(row2, 220, L"%s  ·  %s", TypeStr(a->type), a->desc);
             SetTextColor(mdc, colSub);
         }
-        RECT r2 = {cr.left + 14, cr.top + 31, cr.right - 8, cr.top + 45};
+        RECT r2 = {cr.left + DPS(14), cr.top + DPS(31), cr.right - DPS(8), cr.top + DPS(45)};
         DrawTextW(mdc, row2, -1, &r2, DT_SINGLELINE | DT_END_ELLIPSIS);
 
         /* ── row 3: IPv4  |  DHCP / Static ──────────────────────────── */
@@ -1217,38 +1224,38 @@ static void PaintWidget(HWND hwnd)
         else
             swprintf(ipStr, 64, L"IPv4:  %s", a->ipv4[0] ? a->ipv4 : L"\u2014");
         SetTextColor(mdc, colSub);
-        RECT r3l = {cr.left + 14, cr.top + 49, cr.left + 250, cr.top + 63};
+        RECT r3l = {cr.left + DPS(14), cr.top + DPS(49), cr.left + DPS(250), cr.top + DPS(63)};
         DrawTextW(mdc, ipStr, -1, &r3l, DT_SINGLELINE | DT_END_ELLIPSIS);
 
         const WCHAR *ipMode = a->dhcp ? L"DHCP" : L"Static";
         SetTextColor(mdc, dimmed ? colSub : (a->dhcp ? C_DHCP : C_STAT));
-        RECT r3r = {cr.left + 248, cr.top + 49, cr.right - 8, cr.top + 63};
+        RECT r3r = {cr.left + DPS(248), cr.top + DPS(49), cr.right - DPS(8), cr.top + DPS(63)};
         DrawTextW(mdc, ipMode, -1, &r3r, DT_SINGLELINE | DT_RIGHT);
 
         /* ── row 4: Subnet mask  |  Speed ────────────────────────────── */
         SetTextColor(mdc, colSub);
         WCHAR maskStr[48];
         swprintf(maskStr, 48, L"Mask:  %s", a->mask[0] ? a->mask : L"\u2014");
-        RECT r4l = {cr.left + 14, cr.top + 66, cr.left + 220, cr.top + 80};
+        RECT r4l = {cr.left + DPS(14), cr.top + DPS(66), cr.left + DPS(220), cr.top + DPS(80)};
         DrawTextW(mdc, maskStr, -1, &r4l, DT_SINGLELINE | DT_END_ELLIPSIS);
 
         WCHAR spStr[48];
         swprintf(spStr, 48, L"%s", a->speed);
-        RECT r4r = {cr.left + 218, cr.top + 66, cr.right - 8, cr.top + 80};
+        RECT r4r = {cr.left + DPS(218), cr.top + DPS(66), cr.right - DPS(8), cr.top + DPS(80)};
         DrawTextW(mdc, spStr, -1, &r4r, DT_SINGLELINE | DT_RIGHT);
 
         /* ── row 5: Gateway  |  live throughput ────────────────────── */
         SetTextColor(mdc, colSub);
         WCHAR gwStr[64];
         swprintf(gwStr, 64, L"GW:    %s", a->gw[0] ? a->gw : L"—");
-        RECT r5l = {cr.left + 14, cr.top + 83, cr.left + 200, cr.top + 97};
+        RECT r5l = {cr.left + DPS(14), cr.top + DPS(83), cr.left + DPS(200), cr.top + DPS(97)};
         DrawTextW(mdc, gwStr, -1, &r5l, DT_SINGLELINE | DT_END_ELLIPSIS);
 
         if (a->state == STATE_UP && (a->rxBps || a->txBps)) {
             WCHAR tputStr[64];
             FmtThroughput(a->rxBps, a->txBps, tputStr, 64);
             SetTextColor(mdc, dimmed ? colSub : C_DHCP);
-            RECT r5r = {cr.left + 198, cr.top + 83, cr.right - 8, cr.top + 97};
+            RECT r5r = {cr.left + DPS(198), cr.top + DPS(83), cr.right - DPS(8), cr.top + DPS(97)};
             DrawTextW(mdc, tputStr, -1, &r5r, DT_SINGLELINE | DT_RIGHT);
         }
 
@@ -1261,18 +1268,18 @@ static void PaintWidget(HWND hwnd)
             swprintf(dnsStr, 120, L"DNS:   %s", a->dns1);
         else
             wcscpy(dnsStr, L"DNS:   —");
-        RECT r6 = {cr.left + 14, cr.top + 100, cr.right - 8, cr.top + 114};
+        RECT r6 = {cr.left + DPS(14), cr.top + DPS(100), cr.right - DPS(8), cr.top + DPS(114)};
         DrawTextW(mdc, dnsStr, -1, &r6, DT_SINGLELINE | DT_END_ELLIPSIS);
 
         /* ── row 7: MAC (left)  |  IPv6 (right, truncated) ─────────── */
         WCHAR macStr[36];
         swprintf(macStr, 36, L"MAC:   %s", a->mac);
-        RECT r7l = {cr.left + 14, cr.top + 117, cr.left + 190, cr.top + 131};
+        RECT r7l = {cr.left + DPS(14), cr.top + DPS(117), cr.left + DPS(190), cr.top + DPS(131)};
         DrawTextW(mdc, macStr, -1, &r7l, DT_SINGLELINE | DT_END_ELLIPSIS);
 
         WCHAR ip6Str[90];
         swprintf(ip6Str, 90, L"IPv6:  %s", a->ipv6[0] ? a->ipv6 : L"—");
-        RECT r7r = {cr.left + 185, cr.top + 117, cr.right - 8, cr.top + 131};
+        RECT r7r = {cr.left + DPS(185), cr.top + DPS(117), cr.right - DPS(8), cr.top + DPS(131)};
         DrawTextW(mdc, ip6Str, -1, &r7r, DT_SINGLELINE | DT_RIGHT | DT_END_ELLIPSIS);
 
         y += CARD_H + CARD_GAP;
@@ -1299,7 +1306,7 @@ static void PaintWidget(HWND hwnd)
         HPEN   togPn = CreatePen(PS_SOLID, 1, togBd);
         HBRUSH oTBr  = (HBRUSH)SelectObject(mdc, togBr);
         HPEN   oTPn  = (HPEN)SelectObject(mdc, togPn);
-        RoundRect(mdc, togRc.left, togRc.top, togRc.right, togRc.bottom, 6, 6);
+        RoundRect(mdc, togRc.left, togRc.top, togRc.right, togRc.bottom, DPS(6), DPS(6));
         SelectObject(mdc, oTBr);
         SelectObject(mdc, oTPn);
         DeleteObject(togBr);
@@ -1307,16 +1314,16 @@ static void PaintWidget(HWND hwnd)
 
         /* chevron arrow */
         COLORREF arrowCol = g_togHover ? C_TXT : C_SUB;
-        HPEN arrowPen = CreatePen(PS_SOLID, 2, arrowCol);
+        HPEN arrowPen = CreatePen(PS_SOLID, DPS(2) < 1 ? 1 : DPS(2), arrowCol);
         HPEN oAP = (HPEN)SelectObject(mdc, arrowPen);
-        int ax = togRc.left + 18;
+        int ax = togRc.left + DPS(18);
         int ay = togRc.top  + (TOGGLE_H / 2);
         if (g_showDisabled) {
-            MoveToEx(mdc, ax - 5, ay + 3, NULL); LineTo(mdc, ax,     ay - 3);
-            LineTo  (mdc, ax + 5, ay + 3);
+            MoveToEx(mdc, ax - DPS(5), ay + DPS(3), NULL); LineTo(mdc, ax,          ay - DPS(3));
+            LineTo  (mdc, ax + DPS(5), ay + DPS(3));
         } else {
-            MoveToEx(mdc, ax - 5, ay - 3, NULL); LineTo(mdc, ax,     ay + 3);
-            LineTo  (mdc, ax + 5, ay - 3);
+            MoveToEx(mdc, ax - DPS(5), ay - DPS(3), NULL); LineTo(mdc, ax,          ay + DPS(3));
+            LineTo  (mdc, ax + DPS(5), ay - DPS(3));
         }
         SelectObject(mdc, oAP);
         DeleteObject(arrowPen);
@@ -1329,7 +1336,7 @@ static void PaintWidget(HWND hwnd)
             wcscpy(togLabel, L"Hide disabled");
         else
             swprintf(togLabel, 48, L"Show disabled  (%d)", g_nDisabled);
-        RECT togTxt = {togRc.left + 32, togRc.top, togRc.right - 8, togRc.bottom};
+        RECT togTxt = {togRc.left + DPS(32), togRc.top, togRc.right - DPS(8), togRc.bottom};
         DrawTextW(mdc, togLabel, -1, &togTxt, DT_VCENTER | DT_SINGLELINE);
     }
 
@@ -1363,8 +1370,8 @@ static RECT GetBtnRect(HWND hwnd)
 {
     RECT rc;
     GetClientRect(hwnd, &rc);
-    int bx = rc.right - 8 - BTN_SZ;
-    int by = (30 - BTN_SZ) / 2 + 1;
+    int bx = rc.right - DPS(8) - BTN_SZ;
+    int by = (DPS(30) - BTN_SZ) / 2 + DPS(1);
     RECT btn = {bx, by, bx + BTN_SZ, by + BTN_SZ};
     return btn;
 }
@@ -1388,6 +1395,12 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         case WM_ERASEBKGND:
             return 1;
+
+        /* Monitor / scale changed → rescale all geometry + fonts, reposition */
+        case WM_DPICHANGED:
+            g_dpi = HIWORD(wp);
+            if (g_vis) { PositionWidget(); InvalidateRect(hwnd, NULL, TRUE); }
+            return 0;
 
         /* 1 Hz throughput sampler (runs only while widget is visible) */
         case WM_TIMER:
@@ -1443,12 +1456,12 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         const Adapter *a = &g_ad[i];
                         const WCHAR *copy = NULL;
                         /* Row Y-ranges within the card (matches paint rects) */
-                        if      (offsetInCard >= 31  && offsetInCard <= 45)  copy = a->ssid[0] ? a->ssid : NULL;
-                        else if (offsetInCard >= 49  && offsetInCard <= 63)  copy = a->ipv4[0] ? a->ipv4 : NULL;
-                        else if (offsetInCard >= 66  && offsetInCard <= 80)  copy = a->mask[0] ? a->mask : NULL;
-                        else if (offsetInCard >= 83  && offsetInCard <= 97)  copy = a->gw[0]   ? a->gw   : NULL;
-                        else if (offsetInCard >= 100 && offsetInCard <= 114) copy = a->dns1[0] ? a->dns1 : NULL;
-                        else if (offsetInCard >= 117 && offsetInCard <= 131) {
+                        if      (offsetInCard >= DPS(31)  && offsetInCard <= DPS(45))  copy = a->ssid[0] ? a->ssid : NULL;
+                        else if (offsetInCard >= DPS(49)  && offsetInCard <= DPS(63))  copy = a->ipv4[0] ? a->ipv4 : NULL;
+                        else if (offsetInCard >= DPS(66)  && offsetInCard <= DPS(80))  copy = a->mask[0] ? a->mask : NULL;
+                        else if (offsetInCard >= DPS(83)  && offsetInCard <= DPS(97))  copy = a->gw[0]   ? a->gw   : NULL;
+                        else if (offsetInCard >= DPS(100) && offsetInCard <= DPS(114)) copy = a->dns1[0] ? a->dns1 : NULL;
+                        else if (offsetInCard >= DPS(117) && offsetInCard <= DPS(131)) {
                             /* row 7: MAC on left, IPv6 on right */
                             RECT rc; GetClientRect(hwnd, &rc);
                             copy = (pt.x < rc.right / 2) ? a->mac : (a->ipv6[0] ? a->ipv6 : NULL);
@@ -1614,6 +1627,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     /* Windows 11: custom border colour */
     COLORREF borderCol = C_EDGE;
     DwmSetWindowAttribute(g_hWid, DWMWA_BORDER_COLOR, &borderCol, sizeof(borderCol));
+
+    /* Capture the widget monitor's DPI so all geometry + fonts scale to it.
+       GetDpiForWindow is Win10 1607+, so load it dynamically (no hard dep). */
+    {
+        HMODULE u32 = GetModuleHandleW(L"user32.dll");
+        typedef UINT (WINAPI *PFNGDFW)(HWND);
+        PFNGDFW pGetDpi = u32 ? (PFNGDFW)GetProcAddress(u32, "GetDpiForWindow") : NULL;
+        if (pGetDpi) { UINT d = pGetDpi(g_hWid); if (d) g_dpi = d; }
+    }
 
     /* ── initial data + tray ───────────────────────────────────────────── */
     RefreshAdapters();
