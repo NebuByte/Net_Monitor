@@ -50,7 +50,9 @@
 /* ── Message / ID constants ─────────────────────────────────────────────── */
 #define WM_TRAYICON   (WM_USER + 1)
 #define WM_NETCHANGED (WM_USER + 2)
+#define WM_SCANDONE   (WM_APP  + 2)   /* posted from WLAN notif thread when a scan finishes */
 #define TIMER_TPUT    4001
+#define TIMER_SCAN    4002            /* fallback fetch if the scan-complete notif is missed */
 #define IDM_STARTUP   3001
 #define IDM_EXIT      3002
 #define TRAY_UID      1
@@ -85,6 +87,9 @@
 #define ICON_SZ   DPS(18)    /* connection type icon size */
 #define BTN_SZ    DPS(26)    /* minimize button (square) */
 #define TOGGLE_H  DPS(34)    /* show/hide-disabled button height */
+#define SCAN_BAR_H DPS(26)   /* Wi-Fi "scan nearby networks" toggle bar */
+#define SCAN_ROW_H DPS(32)   /* one scanned network row = 2 text lines */
+#define SCAN_PAD   DPS(6)    /* padding around the results dropdown */
 
 /* ── Adapter state ──────────────────────────────────────────────────────── */
 #define STATE_UP       0   /* connected, operational */
@@ -136,6 +141,25 @@ static WCHAR           g_publicIp[64] = {0};
 static volatile LONG   g_pubIpFetching = 0;
 static ULONGLONG       g_lastSampleMs = 0;
 static UINT            g_dpi          = 96;   /* widget render DPI; set on create + WM_DPICHANGED */
+
+/* ── Wi-Fi scanner state ────────────────────────────────────────────────── */
+typedef struct {
+    WCHAR ssid[34];     /* empty = hidden SSID */
+    BYTE  bssid[6];
+    int   rssi;         /* signal strength in dBm */
+    int   quality;      /* link quality 0-100 */
+    int   band;         /* 24 / 50 / 60 (GHz×10); 0 = unknown */
+    int   channel;
+} ScanNet;
+static ScanNet        *g_scan         = NULL;
+static int             g_scanCount    = 0;
+static int             g_scanCap      = 0;
+static BOOL            g_scanOpen     = FALSE;  /* results dropdown expanded */
+static volatile LONG   g_scanning     = 0;      /* a scan is in flight */
+static BOOL            g_scanHover    = FALSE;
+static HANDLE          g_wlan         = NULL;   /* persistent WLAN handle for scans + notifs */
+static GUID            g_scanGuid;              /* interface currently being scanned */
+static BOOL            g_haveScanGuid = FALSE;
 
 /* ── Prototypes ─────────────────────────────────────────────────────────── */
 static LRESULT CALLBACK MainProc  (HWND, UINT, WPARAM, LPARAM);
@@ -314,6 +338,144 @@ static void QueryWlanInfo(void)
 
     WlanFreeMemory(ifList);
     WlanCloseHandle(h, NULL);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   WI-FI SCANNER  —  lists nearby APs (SSID, BSSID, band, RSSI in dBm) via the
+   WLAN BSS list. The scan is async: WlanScan kicks it off, a notification (or a
+   fallback timer) marshals back to the UI thread, which pulls the BSS list.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* The scanner is hosted by the FIRST connected Wi-Fi card only, so a second
+   connected Wi-Fi adapter can't render a duplicate dropdown from the shared
+   (single, global) scan state. */
+static BOOL IsScanCard(const Adapter *a)
+{
+    if (a->type != IF_TYPE_IEEE80211 || a->state != STATE_UP) return FALSE;
+    for (int i = 0; i < g_nAd; i++) {
+        const Adapter *c = &g_ad[i];
+        if (c->type == IF_TYPE_IEEE80211 && c->state == STATE_UP)
+            return c == a;          /* TRUE only if a is the first connected Wi-Fi */
+    }
+    return FALSE;
+}
+
+/* Extra height a card adds below the standard 7 rows (scan bar + dropdown). */
+static int CardExtraH(const Adapter *a)
+{
+    if (!IsScanCard(a)) return 0;
+    int h = SCAN_BAR_H;                          /* always-visible scan toggle */
+    if (g_scanOpen && !(g_scanning && g_scanCount == 0)) {
+        int rows = g_scanCount > 0 ? g_scanCount : 1;   /* 1 row = "No networks found." */
+        h += SCAN_PAD + rows * SCAN_ROW_H + SCAN_PAD;
+    }
+    return h;
+}
+
+static int CardTotalH(const Adapter *a) { return CARD_H + CardExtraH(a); }
+
+static const WCHAR *BandStr(int band)
+{
+    return band == 24 ? L"2.4 GHz" : band == 50 ? L"5 GHz" :
+           band == 60 ? L"6 GHz"   : L"?";
+}
+
+/* Derive band (24/50/60) and channel from a BSS centre frequency in kHz. */
+static void FreqToBand(ULONG khz, int *band, int *ch)
+{
+    int mhz = (int)(khz / 1000);
+    if (mhz >= 2400 && mhz <= 2500)      { *band = 24; *ch = (mhz == 2484) ? 14 : (mhz - 2407) / 5; }
+    else if (mhz >= 5000 && mhz < 5925)  { *band = 50; *ch = (mhz - 5000) / 5; }
+    else if (mhz >= 5925 && mhz <= 7125) { *band = 60; *ch = (mhz - 5950) / 5; }
+    else                                 { *band = 0;  *ch = 0; }
+}
+
+static void FmtBssid(const BYTE *b, WCHAR *out, int cap)
+{
+    swprintf(out, cap, L"%02X:%02X:%02X:%02X:%02X:%02X",
+             b[0], b[1], b[2], b[3], b[4], b[5]);
+}
+
+/* Sort scanned networks strongest-signal first. */
+static int CmpScan(const void *a, const void *b)
+{
+    return ((const ScanNet *)b)->rssi - ((const ScanNet *)a)->rssi;
+}
+
+/* WLAN notification — runs on a WLAN thread; only marshals to the UI thread. */
+static void WINAPI WlanNotifyCb(PWLAN_NOTIFICATION_DATA data, PVOID ctx)
+{
+    (void)ctx;
+    if (data && data->NotificationSource == WLAN_NOTIFICATION_SOURCE_ACM &&
+        (data->NotificationCode == wlan_notification_acm_scan_complete ||
+         data->NotificationCode == wlan_notification_acm_scan_fail))
+        PostMessageW(g_hWid, WM_SCANDONE, 0, 0);
+}
+
+/* Lazily open a persistent WLAN handle and register for scan notifications. */
+static BOOL EnsureWlan(void)
+{
+    if (g_wlan) return TRUE;
+    DWORD neg;
+    if (WlanOpenHandle(2, NULL, &neg, &g_wlan) != ERROR_SUCCESS) { g_wlan = NULL; return FALSE; }
+    DWORD prev;
+    WlanRegisterNotification(g_wlan, WLAN_NOTIFICATION_SOURCE_ACM, TRUE,
+                             WlanNotifyCb, NULL, NULL, &prev);
+    return TRUE;
+}
+
+/* Pull the latest BSS list into g_scan[] (UI thread, on scan completion). */
+static void FetchScanResults(void)
+{
+    KillTimer(g_hWid, TIMER_SCAN);
+    g_scanCount = 0;
+    if (g_wlan && g_haveScanGuid) {
+        PWLAN_BSS_LIST list = NULL;
+        if (WlanGetNetworkBssList(g_wlan, &g_scanGuid, NULL,
+                                  dot11_BSS_type_any, FALSE, NULL, &list) == ERROR_SUCCESS && list) {
+            for (DWORD i = 0; i < list->dwNumberOfItems; i++) {
+                WLAN_BSS_ENTRY *e = &list->wlanBssEntries[i];
+                if (g_scanCount >= g_scanCap) {
+                    int ncap = g_scanCap ? g_scanCap * 2 : 32;
+                    ScanNet *np = (ScanNet *)realloc(g_scan, (size_t)ncap * sizeof(ScanNet));
+                    if (!np) break;
+                    g_scan = np; g_scanCap = ncap;
+                }
+                ScanNet *n = &g_scan[g_scanCount];
+                int len = (int)e->dot11Ssid.uSSIDLength; if (len > 32) len = 32;
+                if (len > 0) {
+                    int w = MultiByteToWideChar(CP_UTF8, 0, (const char *)e->dot11Ssid.ucSSID,
+                                                len, n->ssid, 33);
+                    n->ssid[(w > 0 && w <= 32) ? w : 0] = 0;
+                } else {
+                    n->ssid[0] = 0;                 /* hidden network */
+                }
+                memcpy(n->bssid, e->dot11Bssid, 6);
+                n->rssi    = (int)e->lRssi;
+                n->quality = (int)e->uLinkQuality;
+                FreqToBand(e->ulChCenterFrequency, &n->band, &n->channel);
+                g_scanCount++;
+            }
+            WlanFreeMemory(list);
+        }
+    }
+    if (g_scanCount > 1) qsort(g_scan, g_scanCount, sizeof(ScanNet), CmpScan);
+    g_scanning = 0;
+}
+
+/* Begin an async scan of the given Wi-Fi interface. */
+static void StartWifiScan(const GUID *guid)
+{
+    if (InterlockedExchange(&g_scanning, 1) == 1) return;   /* one scan at a time */
+    if (!EnsureWlan()) { g_scanning = 0; return; }
+    g_scanGuid     = *guid;
+    g_haveScanGuid = TRUE;
+    g_scanCount    = 0;
+    /* Arm the safety-net timer FIRST so g_scanning is always cleared eventually,
+       even if both the scan-complete notification and the post below are lost. */
+    SetTimer(g_hWid, TIMER_SCAN, 5000, NULL);
+    if (WlanScan(g_wlan, &g_scanGuid, NULL, NULL, NULL) != ERROR_SUCCESS)
+        PostMessageW(g_hWid, WM_SCANDONE, 0, 0);            /* try the cached BSS list sooner */
 }
 
 static void RefreshAdapters(void)
@@ -502,6 +664,17 @@ static void RefreshAdapters(void)
     g_nDisabled = 0;
     for (int i = 0; i < g_nAd; i++)
         if (g_ad[i].state == STATE_DISABLED) g_nDisabled++;
+
+    /* Drop stale scan results if the scanned Wi-Fi interface is no longer a
+       connected adapter (e.g. disconnect/reconnect) — otherwise the dropdown
+       would re-show the old network's BSSIDs as if current. */
+    if (g_haveScanGuid) {
+        BOOL ownerUp = FALSE;
+        for (int i = 0; i < g_nAd; i++)
+            if (g_ad[i].state == STATE_UP && g_ad[i].type == IF_TYPE_IEEE80211 &&
+                memcmp(&g_ad[i].guid, &g_scanGuid, sizeof(GUID)) == 0) { ownerUp = TRUE; break; }
+        if (!ownerUp) { g_scanOpen = FALSE; g_scanCount = 0; g_haveScanGuid = FALSE; }
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -719,11 +892,18 @@ static int CountVisible(void)
     return n > 0 ? n : 1;
 }
 
-/* Height of the scrollable card area (excludes header and toggle) */
+/* Height of the scrollable card area (excludes header and toggle).
+   Cards are no longer uniform — the Wi-Fi card grows with its scan dropdown. */
 static int CardsContentH(void)
 {
-    int vis = CountVisible();
-    return vis * (CARD_H + CARD_GAP) + BPAD;
+    int total = 0, vis = 0;
+    for (int i = 0; i < g_nAd; i++) {
+        if (g_ad[i].state == STATE_DISABLED && !g_showDisabled) continue;
+        total += CardTotalH(&g_ad[i]) + CARD_GAP;
+        vis++;
+    }
+    if (vis == 0) total = CARD_H + CARD_GAP;   /* "no adapters" placeholder */
+    return total + BPAD;
 }
 
 /* Height of the fixed bottom bar (toggle button) */
@@ -1025,6 +1205,7 @@ static void PaintWidget(HWND hwnd)
     HFONT fHdr  = MakeFont(115, FW_BOLD,  L"Segoe UI");
     HFONT fName = MakeFont(105, 600,      L"Segoe UI");  /* 600 = SemiBold */
     HFONT fSub  = MakeFont( 88, FW_NORMAL,L"Segoe UI");
+    HFONT fScan = MakeFont( 78, FW_NORMAL,L"Segoe UI");  /* BSSID / detail line in scan list */
 
     /* ── header bar ─────────────────────────────────────────────────────── */
     RECT hdrRc = {0, 0, W, HDR_H};
@@ -1125,7 +1306,7 @@ static void PaintWidget(HWND hwnd)
         COLORREF cardBgCol = dimmed ? RGB(19, 19, 27) : C_CARD;
         COLORREF edgeCol   = dimmed ? RGB(36, 37, 52) : C_EDGE;
 
-        RECT cr = {HPAD, y, W - HPAD, y + CARD_H};
+        RECT cr = {HPAD, y, W - HPAD, y + CardTotalH(a)};
 
         /* card fill */
         HBRUSH cardBr = CreateSolidBrush(cardBgCol);
@@ -1282,7 +1463,90 @@ static void PaintWidget(HWND hwnd)
         RECT r7r = {cr.left + DPS(185), cr.top + DPS(117), cr.right - DPS(8), cr.top + DPS(131)};
         DrawTextW(mdc, ip6Str, -1, &r7r, DT_SINGLELINE | DT_RIGHT | DT_END_ELLIPSIS);
 
-        y += CARD_H + CARD_GAP;
+        /* ── Wi-Fi scanner: toggle bar + collapsible results dropdown ──── */
+        if (IsScanCard(a)) {
+            int barY = cr.top + CARD_H;
+
+            /* separator above the bar */
+            HPEN sep  = CreatePen(PS_SOLID, 1, edgeCol);
+            HPEN oSep = (HPEN)SelectObject(mdc, sep);
+            MoveToEx(mdc, cr.left + DPS(10), barY, NULL);
+            LineTo  (mdc, cr.right - DPS(10), barY);
+            SelectObject(mdc, oSep);
+            DeleteObject(sep);
+
+            /* expand/collapse chevron */
+            COLORREF barCol = g_scanHover ? C_TXT : C_HDR;
+            HPEN chv  = CreatePen(PS_SOLID, DPS(2) < 1 ? 1 : DPS(2), barCol);
+            HPEN oChv = (HPEN)SelectObject(mdc, chv);
+            int cxx = cr.left + DPS(18), cyy = barY + SCAN_BAR_H / 2;
+            if (g_scanOpen) {                       /* ▾ */
+                MoveToEx(mdc, cxx - DPS(4), cyy - DPS(2), NULL);
+                LineTo  (mdc, cxx,          cyy + DPS(3));
+                LineTo  (mdc, cxx + DPS(4), cyy - DPS(2));
+            } else {                                /* ▸ */
+                MoveToEx(mdc, cxx - DPS(2), cyy - DPS(4), NULL);
+                LineTo  (mdc, cxx + DPS(3), cyy);
+                LineTo  (mdc, cxx - DPS(2), cyy + DPS(4));
+            }
+            SelectObject(mdc, oChv);
+            DeleteObject(chv);
+
+            /* bar label */
+            WCHAR barTxt[48];
+            if (g_scanning)      wcscpy(barTxt, L"Scanning…");
+            else if (g_scanOpen) swprintf(barTxt, 48, L"Nearby networks  (%d)", g_scanCount);
+            else                 wcscpy(barTxt, L"Scan nearby networks");
+            SelectObject(mdc, fSub);
+            SetTextColor(mdc, barCol);
+            RECT btr = {cr.left + DPS(30), barY, cr.right - DPS(10), barY + SCAN_BAR_H};
+            DrawTextW(mdc, barTxt, -1, &btr, DT_SINGLELINE | DT_VCENTER);
+
+            /* results dropdown */
+            if (g_scanOpen && !(g_scanning && g_scanCount == 0)) {
+                int ly = barY + SCAN_BAR_H + SCAN_PAD;
+                if (g_scanCount == 0) {
+                    SelectObject(mdc, fSub);
+                    SetTextColor(mdc, colSub);
+                    RECT er = {cr.left + DPS(16), ly, cr.right - DPS(10), ly + SCAN_ROW_H};
+                    DrawTextW(mdc, L"No networks found.", -1, &er, DT_SINGLELINE | DT_VCENTER);
+                } else {
+                    for (int s = 0; s < g_scanCount; s++) {
+                        ScanNet *n = &g_scan[s];
+                        int ry = ly + s * SCAN_ROW_H;
+
+                        /* line 1: SSID  |  band · dBm (coloured by signal) */
+                        SelectObject(mdc, fSub);
+                        SetTextColor(mdc, C_TXT);
+                        RECT l1 = {cr.left + DPS(16), ry, cr.left + DPS(232), ry + DPS(15)};
+                        DrawTextW(mdc, n->ssid[0] ? n->ssid : L"(hidden network)", -1, &l1,
+                                  DT_SINGLELINE | DT_END_ELLIPSIS);
+
+                        COLORREF sigCol = n->rssi >= -60 ? C_UP : n->rssi >= -75 ? C_STAT : C_DOWN;
+                        WCHAR sig[40];
+                        swprintf(sig, 40, L"%s · %d dBm", BandStr(n->band), n->rssi);
+                        SetTextColor(mdc, sigCol);
+                        RECT s1 = {cr.left + DPS(230), ry, cr.right - DPS(12), ry + DPS(15)};
+                        DrawTextW(mdc, sig, -1, &s1, DT_SINGLELINE | DT_RIGHT);
+
+                        /* line 2: BSSID  |  ch · quality */
+                        SelectObject(mdc, fScan);
+                        SetTextColor(mdc, colSub);
+                        WCHAR bss[20]; FmtBssid(n->bssid, bss, 20);
+                        RECT l2 = {cr.left + DPS(16), ry + DPS(15), cr.left + DPS(232), ry + DPS(29)};
+                        DrawTextW(mdc, bss, -1, &l2, DT_SINGLELINE);
+
+                        WCHAR meta[40];
+                        if (n->channel > 0) swprintf(meta, 40, L"ch %d · %d%%", n->channel, n->quality);
+                        else                swprintf(meta, 40, L"%d%%", n->quality);
+                        RECT s2 = {cr.left + DPS(230), ry + DPS(15), cr.right - DPS(12), ry + DPS(29)};
+                        DrawTextW(mdc, meta, -1, &s2, DT_SINGLELINE | DT_RIGHT);
+                    }
+                }
+            }
+        }
+
+        y += CardTotalH(a) + CARD_GAP;
     }
 
     /* Remove clip region before drawing the fixed toggle button */
@@ -1340,9 +1604,13 @@ static void PaintWidget(HWND hwnd)
         DrawTextW(mdc, togLabel, -1, &togTxt, DT_VCENTER | DT_SINGLELINE);
     }
 
+    /* Deselect our fonts (restore a stock font) so DeleteObject can actually
+       free them — DeleteObject fails on an object still selected into a DC. */
+    SelectObject(mdc, GetStockObject(SYSTEM_FONT));
     DeleteObject(fHdr);
     DeleteObject(fName);
     DeleteObject(fSub);
+    DeleteObject(fScan);
 
     BitBlt(hdc, 0, 0, W, H, mdc, 0, 0, SRCCOPY);
     SelectObject(mdc, obmp);
@@ -1386,6 +1654,29 @@ static RECT GetToggleRect(HWND hwnd)
     return btn;
 }
 
+/* Rect of the Wi-Fi "scan" bar in client coords, if that card is laid out.
+   Walks the cards (variable height) the same way the painter does. */
+static BOOL GetScanBarRect(HWND hwnd, RECT *out)
+{
+    if (!g_vis) return FALSE;
+    RECT rc; GetClientRect(hwnd, &rc);
+    int y = HDR_H + CARD_GAP - g_scrollY;
+    for (int i = 0; i < g_nAd; i++) {
+        if (g_ad[i].state == STATE_DISABLED && !g_showDisabled) continue;
+        const Adapter *a = &g_ad[i];
+        if (IsScanCard(a)) {
+            int barTop = y + CARD_H;
+            out->left   = HPAD;
+            out->top    = barTop;
+            out->right  = rc.right - HPAD;
+            out->bottom = barTop + SCAN_BAR_H;
+            return TRUE;
+        }
+        y += CardTotalH(a) + CARD_GAP;
+    }
+    return FALSE;
+}
+
 static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -1407,12 +1698,23 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (wp == TIMER_TPUT) {
                 SampleThroughput();
                 InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wp == TIMER_SCAN) {       /* scan-complete notif was missed */
+                FetchScanResults();
+                PositionWidget();
+                InvalidateRect(hwnd, NULL, TRUE);
             }
             return 0;
 
         /* Public IP fetch completed → repaint header */
         case WM_APP + 1:
             InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+
+        /* Wi-Fi scan completed → pull results, resize the card, repaint */
+        case WM_SCANDONE:
+            FetchScanResults();
+            PositionWidget();
+            InvalidateRect(hwnd, NULL, TRUE);
             return 0;
 
         /* Mouse wheel scrolling */
@@ -1440,36 +1742,56 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 InvalidateRect(hwnd, NULL, TRUE);
                 return 0;
             }
-            /* Click-to-copy: figure out which card and which row */
+            /* Card area: scan-bar toggle, scan-result row (copy BSSID), or field-copy.
+               Cards are variable height, so walk them like the painter does. */
             if (pt.y >= HDR_H) {
-                int cardY = pt.y - HDR_H - CARD_GAP + g_scrollY;
-                int cardStride = CARD_H + CARD_GAP;
-                int idx = cardY / cardStride;
-                int offsetInCard = cardY - idx * cardStride;
-                if (offsetInCard < 0 || offsetInCard > CARD_H) return 0;
-
-                /* Map visible-index back to g_ad[] */
-                int visSeen = 0;
+                int yy = HDR_H + CARD_GAP - g_scrollY;
                 for (int i = 0; i < g_nAd; i++) {
                     if (g_ad[i].state == STATE_DISABLED && !g_showDisabled) continue;
-                    if (visSeen == idx) {
-                        const Adapter *a = &g_ad[i];
-                        const WCHAR *copy = NULL;
-                        /* Row Y-ranges within the card (matches paint rects) */
-                        if      (offsetInCard >= DPS(31)  && offsetInCard <= DPS(45))  copy = a->ssid[0] ? a->ssid : NULL;
-                        else if (offsetInCard >= DPS(49)  && offsetInCard <= DPS(63))  copy = a->ipv4[0] ? a->ipv4 : NULL;
-                        else if (offsetInCard >= DPS(66)  && offsetInCard <= DPS(80))  copy = a->mask[0] ? a->mask : NULL;
-                        else if (offsetInCard >= DPS(83)  && offsetInCard <= DPS(97))  copy = a->gw[0]   ? a->gw   : NULL;
-                        else if (offsetInCard >= DPS(100) && offsetInCard <= DPS(114)) copy = a->dns1[0] ? a->dns1 : NULL;
-                        else if (offsetInCard >= DPS(117) && offsetInCard <= DPS(131)) {
-                            /* row 7: MAC on left, IPv6 on right */
-                            RECT rc; GetClientRect(hwnd, &rc);
-                            copy = (pt.x < rc.right / 2) ? a->mac : (a->ipv6[0] ? a->ipv6 : NULL);
+                    const Adapter *a = &g_ad[i];
+                    int ch = CardTotalH(a);
+                    if (pt.y >= yy && pt.y < yy + ch) {
+                        int off = pt.y - yy;            /* offset within this card */
+
+                        if (IsScanCard(a)) {
+                            int barTop = CARD_H;
+                            if (off >= barTop && off < barTop + SCAN_BAR_H) {
+                                /* toggle the dropdown; opening triggers a fresh scan */
+                                if (g_scanOpen) g_scanOpen = FALSE;
+                                else { g_scanOpen = TRUE; StartWifiScan(&a->guid); }
+                                PositionWidget();
+                                InvalidateRect(hwnd, NULL, TRUE);
+                                return 0;
+                            }
+                            if (g_scanOpen && g_scanCount > 0) {
+                                int ly = barTop + SCAN_BAR_H + SCAN_PAD;
+                                if (off >= ly) {
+                                    int row = (off - ly) / SCAN_ROW_H;
+                                    if (row >= 0 && row < g_scanCount) {
+                                        WCHAR bss[20]; FmtBssid(g_scan[row].bssid, bss, 20);
+                                        CopyToClipboard(bss);   /* click a network → copy its BSSID */
+                                    }
+                                    return 0;
+                                }
+                            }
                         }
-                        if (copy) CopyToClipboard(copy);
-                        break;
+
+                        if (off <= CARD_H) {
+                            const WCHAR *copy = NULL;
+                            if      (off >= DPS(31)  && off <= DPS(45))  copy = a->ssid[0] ? a->ssid : NULL;
+                            else if (off >= DPS(49)  && off <= DPS(63))  copy = a->ipv4[0] ? a->ipv4 : NULL;
+                            else if (off >= DPS(66)  && off <= DPS(80))  copy = a->mask[0] ? a->mask : NULL;
+                            else if (off >= DPS(83)  && off <= DPS(97))  copy = a->gw[0]   ? a->gw   : NULL;
+                            else if (off >= DPS(100) && off <= DPS(114)) copy = a->dns1[0] ? a->dns1 : NULL;
+                            else if (off >= DPS(117) && off <= DPS(131)) {
+                                RECT rc; GetClientRect(hwnd, &rc);
+                                copy = (pt.x < rc.right / 2) ? a->mac : (a->ipv6[0] ? a->ipv6 : NULL);
+                            }
+                            if (copy) CopyToClipboard(copy);
+                        }
+                        return 0;
                     }
-                    visSeen++;
+                    yy += ch + CARD_GAP;
                 }
             }
             return 0;
@@ -1480,11 +1802,15 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             POINT pt     = {(short)LOWORD(lp), (short)HIWORD(lp)};
             RECT  rBtn   = GetBtnRect(hwnd);
             RECT  rTog   = GetToggleRect(hwnd);
+            RECT  rScan;
+            BOOL  hasScan = GetScanBarRect(hwnd, &rScan);
             BOOL  hBtn   = PtInRect(&rBtn, pt);
             BOOL  hTog   = g_nDisabled > 0 && PtInRect(&rTog, pt);
-            if (hBtn != g_btnHover || hTog != g_togHover) {
-                g_btnHover = hBtn;
-                g_togHover = hTog;
+            BOOL  hScan  = hasScan && PtInRect(&rScan, pt);
+            if (hBtn != g_btnHover || hTog != g_togHover || hScan != g_scanHover) {
+                g_btnHover  = hBtn;
+                g_togHover  = hTog;
+                g_scanHover = hScan;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
@@ -1493,8 +1819,8 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
 
         case WM_MOUSELEAVE:
-            if (g_btnHover || g_togHover) {
-                g_btnHover = g_togHover = FALSE;
+            if (g_btnHover || g_togHover || g_scanHover) {
+                g_btnHover = g_togHover = g_scanHover = FALSE;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
@@ -1557,6 +1883,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 case IDM_EXIT:
                     Shell_NotifyIconW(NIM_DELETE, &g_nid);
                     if (g_hNotify) CancelMibChangeNotify2(g_hNotify);
+                    if (g_wlan) { WlanCloseHandle(g_wlan, NULL); g_wlan = NULL; }
+                    free(g_scan);
                     free(g_ad);
                     PostQuitMessage(0);
                     break;
