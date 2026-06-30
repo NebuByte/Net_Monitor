@@ -145,6 +145,11 @@ static ULONGLONG       g_lastSampleMs = 0;
 static UINT            g_dpi          = 96;   /* widget render DPI; set on create + WM_DPICHANGED */
 
 /* ── Wi-Fi scanner state ────────────────────────────────────────────────── */
+/* Security type of a scanned network — drives the lock icon and which profile
+   XML we generate (WPA3 needs SAE, not PSK). */
+#define SEC_OPEN 0   /* open, or OWE "enhanced open" — no password */
+#define SEC_PSK  1   /* WPA / WPA2-Personal (PSK) */
+#define SEC_SAE  2   /* WPA3-Personal (SAE) */
 typedef struct {
     WCHAR ssid[34];     /* empty = hidden SSID */
     BYTE  bssid[6];
@@ -152,7 +157,7 @@ typedef struct {
     int   quality;      /* link quality 0-100 */
     int   band;         /* 24 / 50 / 60 (GHz×10); 0 = unknown */
     int   channel;
-    BOOL  secured;      /* requires a key (802.11 Privacy bit) */
+    int   sec;          /* SEC_OPEN / SEC_PSK / SEC_SAE */
 } ScanNet;
 static ScanNet        *g_scan         = NULL;
 static int             g_scanCount    = 0;
@@ -449,6 +454,20 @@ static BOOL EnsureWlan(void)
     return TRUE;
 }
 
+/* Map a DOT11_AUTH_ALGORITHM (taken as int, so it builds on SDKs predating the
+   WPA3 enumerators) to our SEC_* type. */
+static int AuthToSec(int authAlgo, BOOL secEnabled)
+{
+    switch (authAlgo) {
+        case 9:  return SEC_SAE;     /* DOT11_AUTH_ALGO_WPA3_SAE  → WPA3-Personal */
+        case 7:                      /* DOT11_AUTH_ALGO_RSNA_PSK  → WPA2-Personal */
+        case 4:  return SEC_PSK;     /* DOT11_AUTH_ALGO_WPA_PSK   → WPA-Personal  */
+        case 1:                      /* DOT11_AUTH_ALGO_80211_OPEN → open         */
+        case 10: return SEC_OPEN;    /* DOT11_AUTH_ALGO_OWE       → enhanced open */
+        default: return secEnabled ? SEC_PSK : SEC_OPEN;
+    }
+}
+
 /* Pull the latest BSS list into g_scan[] (UI thread, on scan completion). */
 static void FetchScanResults(void)
 {
@@ -478,13 +497,35 @@ static void FetchScanResults(void)
                 memcpy(n->bssid, e->dot11Bssid, 6);
                 n->rssi    = (int)e->lRssi;
                 n->quality = (int)e->uLinkQuality;
-                n->secured = (e->usCapabilityInformation & 0x0010) != 0;  /* Privacy bit */
+                n->sec = (e->usCapabilityInformation & 0x0010) ? SEC_PSK : SEC_OPEN;  /* default; refined below */
                 FreqToBand(e->ulChCenterFrequency, &n->band, &n->channel);
                 g_scanCount++;
             }
             WlanFreeMemory(list);
         }
     }
+
+    /* Refine the security type per SSID from the available-network list, which
+       reports the auth algorithm — so we can tell WPA3 (SAE) from WPA2 (PSK).
+       The BSS Privacy bit only says secured/open. */
+    if (g_wlan && g_haveScanGuid && g_scanCount > 0) {
+        PWLAN_AVAILABLE_NETWORK_LIST avail = NULL;
+        if (WlanGetAvailableNetworkList(g_wlan, &g_scanGuid, 0, NULL, &avail) == ERROR_SUCCESS && avail) {
+            for (DWORD i = 0; i < avail->dwNumberOfItems; i++) {
+                WLAN_AVAILABLE_NETWORK *an = &avail->Network[i];
+                WCHAR aw[34];
+                int al = (int)an->dot11Ssid.uSSIDLength; if (al > 32) al = 32;
+                int w  = al > 0 ? MultiByteToWideChar(CP_UTF8, 0, (const char *)an->dot11Ssid.ucSSID, al, aw, 33) : 0;
+                aw[(w > 0 && w <= 32) ? w : 0] = 0;
+                if (!aw[0]) continue;
+                int sec = AuthToSec((int)an->dot11DefaultAuthAlgorithm, an->bSecurityEnabled);
+                for (int k = 0; k < g_scanCount; k++)
+                    if (wcscmp(g_scan[k].ssid, aw) == 0) g_scan[k].sec = sec;
+            }
+            WlanFreeMemory(avail);
+        }
+    }
+
     if (g_scanCount > 1) qsort(g_scan, g_scanCount, sizeof(ScanNet), CmpScan);
     g_scanning = 0;
 }
@@ -530,26 +571,12 @@ static void XmlEsc(const WCHAR *in, WCHAR *out, int cap)
     out[o] = 0;
 }
 
-/* Build a WLAN profile XML for SSID: WPA2-PSK/AES when secured, open otherwise. */
-static void BuildProfileXml(const WCHAR *ssid, const WCHAR *pwd, BOOL secured, WCHAR *out, int cap)
+/* Build a WLAN profile XML for SSID: WPA3-SAE, WPA2-PSK, or open per `sec`. */
+static void BuildProfileXml(const WCHAR *ssid, const WCHAR *pwd, int sec, WCHAR *out, int cap)
 {
     WCHAR es[80], ep[260];
     XmlEsc(ssid, es, 80);
-    if (secured) {
-        XmlEsc(pwd, ep, 260);
-        swprintf(out, cap,
-            L"<?xml version=\"1.0\"?>"
-            L"<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
-            L"<name>%s</name>"
-            L"<SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>"
-            L"<connectionType>ESS</connectionType><connectionMode>auto</connectionMode>"
-            L"<MSM><security>"
-            L"<authEncryption><authentication>WPA2PSK</authentication>"
-            L"<encryption>AES</encryption><useOneX>false</useOneX></authEncryption>"
-            L"<sharedKey><keyType>passPhrase</keyType><protected>false</protected>"
-            L"<keyMaterial>%s</keyMaterial></sharedKey>"
-            L"</security></MSM></WLANProfile>", es, es, ep);
-    } else {
+    if (sec == SEC_OPEN) {
         swprintf(out, cap,
             L"<?xml version=\"1.0\"?>"
             L"<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
@@ -559,6 +586,22 @@ static void BuildProfileXml(const WCHAR *ssid, const WCHAR *pwd, BOOL secured, W
             L"<MSM><security><authEncryption><authentication>open</authentication>"
             L"<encryption>none</encryption><useOneX>false</useOneX></authEncryption>"
             L"</security></MSM></WLANProfile>", es, es);
+    } else {
+        /* WPA3-Personal uses SAE; WPA2-Personal uses PSK. Both take a passphrase. */
+        const WCHAR *auth = (sec == SEC_SAE) ? L"WPA3SAE" : L"WPA2PSK";
+        XmlEsc(pwd, ep, 260);
+        swprintf(out, cap,
+            L"<?xml version=\"1.0\"?>"
+            L"<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
+            L"<name>%s</name>"
+            L"<SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>"
+            L"<connectionType>ESS</connectionType><connectionMode>auto</connectionMode>"
+            L"<MSM><security>"
+            L"<authEncryption><authentication>%s</authentication>"
+            L"<encryption>AES</encryption><useOneX>false</useOneX></authEncryption>"
+            L"<sharedKey><keyType>passPhrase</keyType><protected>false</protected>"
+            L"<keyMaterial>%s</keyMaterial></sharedKey>"
+            L"</security></MSM></WLANProfile>", es, es, auth, ep);
     }
 }
 
@@ -695,10 +738,10 @@ static void ConnectToScan(int idx)
 
     if (!HasSavedProfile(n->ssid)) {
         WCHAR pwd[128] = {0};
-        if (n->secured && !PromptPassword(n->ssid, pwd, 128)) return;   /* cancelled */
+        if (n->sec != SEC_OPEN && !PromptPassword(n->ssid, pwd, 128)) return;   /* cancelled */
 
         WCHAR xml[1300];
-        BuildProfileXml(n->ssid, pwd, n->secured, xml, 1300);
+        BuildProfileXml(n->ssid, pwd, n->sec, xml, 1300);
         SecureZeroMemory(pwd, sizeof(pwd));
         DWORD reason = 0;
         DWORD r = WlanSetProfile(g_wlan, &g_scanGuid, 0x00000002 /* WLAN_PROFILE_USER */,
@@ -1778,7 +1821,7 @@ static void PaintWidget(HWND hwnd)
 
                         /* line 1: [lock] SSID [✓ if connected]  |  band · dBm */
                         int tx = cr.left + DPS(16);
-                        if (n->secured) {
+                        if (n->sec != SEC_OPEN) {
                             SelectObject(mdc, fIcon);
                             SetTextColor(mdc, colSub);
                             RECT lk = {tx, ry, tx + DPS(16), ry + DPS(15)};
@@ -1809,9 +1852,10 @@ static void PaintWidget(HWND hwnd)
                         RECT l2 = {cr.left + DPS(16), ry + DPS(15), cr.left + DPS(232), ry + DPS(29)};
                         DrawTextW(mdc, bss, -1, &l2, DT_SINGLELINE);
 
-                        WCHAR meta[40];
-                        if (n->channel > 0) swprintf(meta, 40, L"ch %d · %d%%", n->channel, n->quality);
-                        else                swprintf(meta, 40, L"%d%%", n->quality);
+                        WCHAR meta[48];
+                        const WCHAR *secL = (n->sec == SEC_SAE) ? L" · WPA3" : L"";
+                        if (n->channel > 0) swprintf(meta, 48, L"ch %d · %d%%%s", n->channel, n->quality, secL);
+                        else                swprintf(meta, 48, L"%d%%%s", n->quality, secL);
                         RECT s2 = {cr.left + DPS(230), ry + DPS(15), cr.right - DPS(12), ry + DPS(29)};
                         DrawTextW(mdc, meta, -1, &s2, DT_SINGLELINE | DT_RIGHT);
                     }
