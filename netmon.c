@@ -51,8 +51,10 @@
 #define WM_TRAYICON   (WM_USER + 1)
 #define WM_NETCHANGED (WM_USER + 2)
 #define WM_SCANDONE   (WM_APP  + 2)   /* posted from WLAN notif thread when a scan finishes */
+#define WM_CONNDONE   (WM_APP  + 3)   /* posted from WLAN notif thread when a connect attempt finishes; wParam = reason code */
 #define TIMER_TPUT    4001
 #define TIMER_SCAN    4002            /* fallback fetch if the scan-complete notif is missed */
+#define TIMER_CONNCLR 4003            /* clears a transient "couldn't connect" message */
 #define IDM_STARTUP   3001
 #define IDM_EXIT      3002
 #define TRAY_UID      1
@@ -150,6 +152,7 @@ typedef struct {
     int   quality;      /* link quality 0-100 */
     int   band;         /* 24 / 50 / 60 (GHz×10); 0 = unknown */
     int   channel;
+    BOOL  secured;      /* requires a key (802.11 Privacy bit) */
 } ScanNet;
 static ScanNet        *g_scan         = NULL;
 static int             g_scanCount    = 0;
@@ -160,6 +163,15 @@ static BOOL            g_scanHover    = FALSE;
 static HANDLE          g_wlan         = NULL;   /* persistent WLAN handle for scans + notifs */
 static GUID            g_scanGuid;              /* interface currently being scanned */
 static BOOL            g_haveScanGuid = FALSE;
+
+/* ── Wi-Fi connect state ────────────────────────────────────────────────── */
+static int             g_connState    = 0;      /* 0 idle, 1 connecting, 2 failed (transient) */
+static WCHAR           g_connSsid[34] = {0};    /* SSID shown in the connect status line */
+static HWND            g_pwdEdit      = NULL;    /* password dialog edit control */
+static WCHAR           g_pwdBuf[128]  = {0};
+static BOOL            g_pwdOk        = FALSE;
+static int             g_scanRowHover = -1;     /* scan-result row under the cursor (-1 = none) */
+static int             g_scanRowPress = -1;     /* scan-result row being pressed */
 
 /* ── Prototypes ─────────────────────────────────────────────────────────── */
 static LRESULT CALLBACK MainProc  (HWND, UINT, WPARAM, LPARAM);
@@ -282,7 +294,11 @@ static BOOL IsAdapterRegistered(const WCHAR *guidW)
 
 static int CmpAdapters(const void *a, const void *b)
 {
-    return ((const Adapter *)a)->state - ((const Adapter *)b)->state;
+    const Adapter *x = (const Adapter *)a, *y = (const Adapter *)b;
+    if (x->state != y->state) return x->state - y->state;        /* UP → DOWN → DISABLED */
+    int xw = (x->type == IF_TYPE_IEEE80211) ? 0 : 1;
+    int yw = (y->type == IF_TYPE_IEEE80211) ? 0 : 1;
+    return xw - yw;   /* within a state group, Wi-Fi sorts first (connected Wi-Fi on top) */
 }
 
 /* Query Wi-Fi SSID + signal strength for all connected WLAN interfaces
@@ -406,10 +422,19 @@ static int CmpScan(const void *a, const void *b)
 static void WINAPI WlanNotifyCb(PWLAN_NOTIFICATION_DATA data, PVOID ctx)
 {
     (void)ctx;
-    if (data && data->NotificationSource == WLAN_NOTIFICATION_SOURCE_ACM &&
-        (data->NotificationCode == wlan_notification_acm_scan_complete ||
-         data->NotificationCode == wlan_notification_acm_scan_fail))
-        PostMessageW(g_hWid, WM_SCANDONE, 0, 0);
+    if (!data || data->NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM) return;
+    switch (data->NotificationCode) {
+        case wlan_notification_acm_scan_complete:
+        case wlan_notification_acm_scan_fail:
+            PostMessageW(g_hWid, WM_SCANDONE, 0, 0);
+            break;
+        case wlan_notification_acm_connection_complete:
+        case wlan_notification_acm_connection_attempt_fail: {
+            WLAN_CONNECTION_NOTIFICATION_DATA *cd = (WLAN_CONNECTION_NOTIFICATION_DATA *)data->pData;
+            PostMessageW(g_hWid, WM_CONNDONE, (WPARAM)(cd ? cd->wlanReasonCode : 1), 0);
+            break;
+        }
+    }
 }
 
 /* Lazily open a persistent WLAN handle and register for scan notifications. */
@@ -453,6 +478,7 @@ static void FetchScanResults(void)
                 memcpy(n->bssid, e->dot11Bssid, 6);
                 n->rssi    = (int)e->lRssi;
                 n->quality = (int)e->uLinkQuality;
+                n->secured = (e->usCapabilityInformation & 0x0010) != 0;  /* Privacy bit */
                 FreqToBand(e->ulChCenterFrequency, &n->band, &n->channel);
                 g_scanCount++;
             }
@@ -476,6 +502,225 @@ static void StartWifiScan(const GUID *guid)
     SetTimer(g_hWid, TIMER_SCAN, 5000, NULL);
     if (WlanScan(g_wlan, &g_scanGuid, NULL, NULL, NULL) != ERROR_SUCCESS)
         PostMessageW(g_hWid, WM_SCANDONE, 0, 0);            /* try the cached BSS list sooner */
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   WI-FI CONNECT  —  click a scanned network to join it. If Windows already has
+   a saved profile we connect straight away; otherwise we prompt for a password,
+   persist a profile (so it's instant next time), then connect. Result arrives
+   asynchronously via WM_CONNDONE.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* XML-escape a string into out (NUL-terminated, bounded by cap). */
+static void XmlEsc(const WCHAR *in, WCHAR *out, int cap)
+{
+    int o = 0;
+    for (int i = 0; in[i] && o < cap - 7; i++) {
+        const WCHAR *r = NULL;
+        switch (in[i]) {
+            case L'&':  r = L"&amp;";  break;
+            case L'<':  r = L"&lt;";   break;
+            case L'>':  r = L"&gt;";   break;
+            case L'"':  r = L"&quot;"; break;
+            case L'\'': r = L"&apos;"; break;
+        }
+        if (r) while (*r) out[o++] = *r++;
+        else   out[o++] = in[i];
+    }
+    out[o] = 0;
+}
+
+/* Build a WLAN profile XML for SSID: WPA2-PSK/AES when secured, open otherwise. */
+static void BuildProfileXml(const WCHAR *ssid, const WCHAR *pwd, BOOL secured, WCHAR *out, int cap)
+{
+    WCHAR es[80], ep[260];
+    XmlEsc(ssid, es, 80);
+    if (secured) {
+        XmlEsc(pwd, ep, 260);
+        swprintf(out, cap,
+            L"<?xml version=\"1.0\"?>"
+            L"<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
+            L"<name>%s</name>"
+            L"<SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>"
+            L"<connectionType>ESS</connectionType><connectionMode>auto</connectionMode>"
+            L"<MSM><security>"
+            L"<authEncryption><authentication>WPA2PSK</authentication>"
+            L"<encryption>AES</encryption><useOneX>false</useOneX></authEncryption>"
+            L"<sharedKey><keyType>passPhrase</keyType><protected>false</protected>"
+            L"<keyMaterial>%s</keyMaterial></sharedKey>"
+            L"</security></MSM></WLANProfile>", es, es, ep);
+    } else {
+        swprintf(out, cap,
+            L"<?xml version=\"1.0\"?>"
+            L"<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
+            L"<name>%s</name>"
+            L"<SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>"
+            L"<connectionType>ESS</connectionType><connectionMode>auto</connectionMode>"
+            L"<MSM><security><authEncryption><authentication>open</authentication>"
+            L"<encryption>none</encryption><useOneX>false</useOneX></authEncryption>"
+            L"</security></MSM></WLANProfile>", es, es);
+    }
+}
+
+/* TRUE if Windows already has a saved profile for this SSID on the scan interface. */
+static BOOL HasSavedProfile(const WCHAR *ssid)
+{
+    if (!g_wlan || !g_haveScanGuid) return FALSE;
+    LPWSTR xml = NULL; DWORD flags = 0, access = 0;
+    if (WlanGetProfile(g_wlan, &g_scanGuid, ssid, NULL, &xml, &flags, &access) == ERROR_SUCCESS) {
+        if (xml) WlanFreeMemory(xml);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Connect the scan interface using a saved profile named profileName (== SSID). */
+static DWORD DoWlanConnect(const WCHAR *profileName)
+{
+    WLAN_CONNECTION_PARAMETERS cp = {0};
+    cp.wlanConnectionMode = wlan_connection_mode_profile;
+    cp.strProfile         = profileName;
+    cp.dot11BssType       = dot11_BSS_type_infrastructure;
+    return WlanConnect(g_wlan, &g_scanGuid, &cp, NULL);
+}
+
+/* ── modal password prompt ──────────────────────────────────────────────── */
+static LRESULT CALLBACK PwdProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case IDOK:
+                    GetWindowTextW(g_pwdEdit, g_pwdBuf, 128);
+                    g_pwdOk = TRUE;  DestroyWindow(hwnd); return 0;
+                case IDCANCEL:
+                    g_pwdOk = FALSE; DestroyWindow(hwnd); return 0;
+                case 101:   /* show-password checkbox */
+                    if (HIWORD(wp) == BN_CLICKED) {
+                        BOOL show = SendDlgItemMessageW(hwnd, 101, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                        SendMessageW(g_pwdEdit, EM_SETPASSWORDCHAR, show ? 0 : (WPARAM)0x25CF, 0);
+                        InvalidateRect(g_pwdEdit, NULL, TRUE);
+                    }
+                    return 0;
+            }
+            break;
+        case WM_CLOSE: g_pwdOk = FALSE; DestroyWindow(hwnd); return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Show a modal password dialog for ssid; returns TRUE and fills out on Connect. */
+static BOOL PromptPassword(const WCHAR *ssid, WCHAR *out, int cap)
+{
+    static BOOL reg = FALSE;
+    if (!reg) {
+        WNDCLASSEXW wc = {0};
+        wc.cbSize        = sizeof(wc);
+        wc.lpfnWndProc   = PwdProc;
+        wc.hInstance     = g_hInst;
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"NetMon_PwdDlg";
+        RegisterClassExW(&wc);
+        reg = TRUE;
+    }
+
+    int W = DPS(380), H = DPS(200);
+    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = wa.left + ((wa.right - wa.left) - W) / 2;
+    int y = wa.top  + ((wa.bottom - wa.top) - H) / 2;
+    WCHAR title[80]; swprintf(title, 80, L"Connect to %s", ssid);
+
+    HWND dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+        L"NetMon_PwdDlg", title, WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, g_hWid, NULL, g_hInst, NULL);
+    if (!dlg) return FALSE;
+
+    HFONT df = MakeFont(95, FW_NORMAL, L"Segoe UI");
+    HWND lbl = CreateWindowExW(0, L"STATIC", L"Enter the network password:",
+        WS_CHILD | WS_VISIBLE, DPS(16), DPS(12), DPS(340), DPS(20), dlg, NULL, g_hInst, NULL);
+    g_pwdEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+        DPS(16), DPS(38), DPS(348), DPS(26), dlg, (HMENU)(INT_PTR)100, g_hInst, NULL);
+    HWND chk = CreateWindowExW(0, L"BUTTON", L"Show password",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        DPS(16), DPS(72), DPS(160), DPS(22), dlg, (HMENU)(INT_PTR)101, g_hInst, NULL);
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"Connect",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        W - DPS(196), DPS(106), DPS(86), DPS(30), dlg, (HMENU)(INT_PTR)IDOK, g_hInst, NULL);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        W - DPS(102), DPS(106), DPS(86), DPS(30), dlg, (HMENU)(INT_PTR)IDCANCEL, g_hInst, NULL);
+
+    SendMessageW(lbl,       WM_SETFONT, (WPARAM)df, TRUE);
+    SendMessageW(g_pwdEdit, WM_SETFONT, (WPARAM)df, TRUE);
+    SendMessageW(chk,       WM_SETFONT, (WPARAM)df, TRUE);
+    SendMessageW(ok,        WM_SETFONT, (WPARAM)df, TRUE);
+    SendMessageW(cancel,    WM_SETFONT, (WPARAM)df, TRUE);
+    SendMessageW(g_pwdEdit, EM_SETPASSWORDCHAR, (WPARAM)0x25CF, 0);   /* bullet char */
+
+    g_pwdOk = FALSE; g_pwdBuf[0] = 0;
+    EnableWindow(g_hWid, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+    SetFocus(g_pwdEdit);
+
+    MSG m;
+    for (;;) {
+        if (!IsWindow(dlg)) break;
+        int gm = GetMessageW(&m, NULL, 0, 0);
+        if (gm == 0)  { PostQuitMessage((int)m.wParam); break; }   /* re-post WM_QUIT for the outer loop */
+        if (gm == -1) break;
+        if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN) { SendMessageW(dlg, WM_COMMAND, IDOK, 0);     continue; }
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { SendMessageW(dlg, WM_COMMAND, IDCANCEL, 0); continue; }
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+
+    EnableWindow(g_hWid, TRUE);
+    DeleteObject(df);
+    g_pwdEdit = NULL;
+
+    BOOL ok2 = g_pwdOk;
+    if (ok2) { wcsncpy(out, g_pwdBuf, cap - 1); out[cap - 1] = 0; }
+    SecureZeroMemory(g_pwdBuf, sizeof(g_pwdBuf));
+    return ok2;
+}
+
+/* Orchestrate a click-to-connect on scan row idx. */
+static void ConnectToScan(int idx)
+{
+    if (idx < 0 || idx >= g_scanCount || !g_wlan || !g_haveScanGuid) return;
+    ScanNet *n = &g_scan[idx];
+    if (!n->ssid[0]) return;                       /* can't join a hidden SSID by click */
+
+    if (!HasSavedProfile(n->ssid)) {
+        WCHAR pwd[128] = {0};
+        if (n->secured && !PromptPassword(n->ssid, pwd, 128)) return;   /* cancelled */
+
+        WCHAR xml[1300];
+        BuildProfileXml(n->ssid, pwd, n->secured, xml, 1300);
+        SecureZeroMemory(pwd, sizeof(pwd));
+        DWORD reason = 0;
+        DWORD r = WlanSetProfile(g_wlan, &g_scanGuid, 0x00000002 /* WLAN_PROFILE_USER */,
+                                 xml, NULL, TRUE, NULL, &reason);
+        SecureZeroMemory(xml, sizeof(xml));
+        if (r != ERROR_SUCCESS) {
+            g_connState = 2; wcsncpy(g_connSsid, n->ssid, 33); g_connSsid[33] = 0;
+            SetTimer(g_hWid, TIMER_CONNCLR, 4000, NULL);
+            InvalidateRect(g_hWid, NULL, TRUE);
+            return;
+        }
+    }
+
+    g_connState = 1;
+    wcsncpy(g_connSsid, n->ssid, 33); g_connSsid[33] = 0;
+    InvalidateRect(g_hWid, NULL, TRUE);
+    if (DoWlanConnect(n->ssid) != ERROR_SUCCESS) {       /* couldn't even start the attempt */
+        g_connState = 2;
+        SetTimer(g_hWid, TIMER_CONNCLR, 4000, NULL);
+        InvalidateRect(g_hWid, NULL, TRUE);
+    }
+    /* the actual association result arrives asynchronously via WM_CONNDONE */
 }
 
 static void RefreshAdapters(void)
@@ -1206,6 +1451,7 @@ static void PaintWidget(HWND hwnd)
     HFONT fName = MakeFont(105, 600,      L"Segoe UI");  /* 600 = SemiBold */
     HFONT fSub  = MakeFont( 88, FW_NORMAL,L"Segoe UI");
     HFONT fScan = MakeFont( 78, FW_NORMAL,L"Segoe UI");  /* BSSID / detail line in scan list */
+    HFONT fIcon = MakeFont( 80, FW_NORMAL,L"Segoe MDL2 Assets");  /* lock glyph for secured nets */
 
     /* ── header bar ─────────────────────────────────────────────────────── */
     RECT hdrRc = {0, 0, W, HDR_H};
@@ -1476,7 +1722,7 @@ static void PaintWidget(HWND hwnd)
             DeleteObject(sep);
 
             /* expand/collapse chevron */
-            COLORREF barCol = g_scanHover ? C_TXT : C_HDR;
+            COLORREF barCol = g_connState == 2 ? C_DOWN : (g_scanHover ? C_TXT : C_HDR);
             HPEN chv  = CreatePen(PS_SOLID, DPS(2) < 1 ? 1 : DPS(2), barCol);
             HPEN oChv = (HPEN)SelectObject(mdc, chv);
             int cxx = cr.left + DPS(18), cyy = barY + SCAN_BAR_H / 2;
@@ -1492,11 +1738,13 @@ static void PaintWidget(HWND hwnd)
             SelectObject(mdc, oChv);
             DeleteObject(chv);
 
-            /* bar label */
-            WCHAR barTxt[48];
-            if (g_scanning)      wcscpy(barTxt, L"Scanning…");
-            else if (g_scanOpen) swprintf(barTxt, 48, L"Nearby networks  (%d)", g_scanCount);
-            else                 wcscpy(barTxt, L"Scan nearby networks");
+            /* bar label — connect status takes priority over scan state */
+            WCHAR barTxt[80];
+            if      (g_connState == 1) swprintf(barTxt, 80, L"Connecting to %s…", g_connSsid);
+            else if (g_connState == 2) swprintf(barTxt, 80, L"Couldn't connect to %s", g_connSsid);
+            else if (g_scanning)       wcscpy(barTxt, L"Scanning…");
+            else if (g_scanOpen)       swprintf(barTxt, 80, L"Nearby networks  (%d)", g_scanCount);
+            else                       wcscpy(barTxt, L"Scan nearby networks");
             SelectObject(mdc, fSub);
             SetTextColor(mdc, barCol);
             RECT btr = {cr.left + DPS(30), barY, cr.right - DPS(10), barY + SCAN_BAR_H};
@@ -1515,12 +1763,37 @@ static void PaintWidget(HWND hwnd)
                         ScanNet *n = &g_scan[s];
                         int ry = ly + s * SCAN_ROW_H;
 
-                        /* line 1: SSID  |  band · dBm (coloured by signal) */
+                        /* hover / pressed highlight behind the row */
+                        if (s == g_scanRowPress || s == g_scanRowHover) {
+                            COLORREF hl = (s == g_scanRowPress) ? RGB(52, 56, 82) : RGB(36, 38, 55);
+                            HBRUSH hb  = CreateSolidBrush(hl);
+                            HBRUSH ohb = (HBRUSH)SelectObject(mdc, hb);
+                            HPEN   ohp = (HPEN)SelectObject(mdc, GetStockObject(NULL_PEN));
+                            RoundRect(mdc, cr.left + DPS(6), ry - DPS(2),
+                                      cr.right - DPS(6), ry + SCAN_ROW_H - DPS(4), DPS(6), DPS(6));
+                            SelectObject(mdc, ohp);
+                            SelectObject(mdc, ohb);
+                            DeleteObject(hb);
+                        }
+
+                        /* line 1: [lock] SSID [✓ if connected]  |  band · dBm */
+                        int tx = cr.left + DPS(16);
+                        if (n->secured) {
+                            SelectObject(mdc, fIcon);
+                            SetTextColor(mdc, colSub);
+                            RECT lk = {tx, ry, tx + DPS(16), ry + DPS(15)};
+                            DrawTextW(mdc, L"", -1, &lk, DT_SINGLELINE | DT_VCENTER);  /* MDL2 lock */
+                            tx += DPS(17);
+                        }
+                        BOOL isConn = (a->ssid[0] && wcscmp(n->ssid, a->ssid) == 0);
                         SelectObject(mdc, fSub);
-                        SetTextColor(mdc, C_TXT);
-                        RECT l1 = {cr.left + DPS(16), ry, cr.left + DPS(232), ry + DPS(15)};
-                        DrawTextW(mdc, n->ssid[0] ? n->ssid : L"(hidden network)", -1, &l1,
-                                  DT_SINGLELINE | DT_END_ELLIPSIS);
+                        SetTextColor(mdc, isConn ? C_UP : C_TXT);
+                        WCHAR nm[44];
+                        if      (isConn)     swprintf(nm, 44, L"%s  ✓", n->ssid);   /* ✓ connected */
+                        else if (n->ssid[0]) { wcsncpy(nm, n->ssid, 43); nm[43] = 0; }
+                        else                 wcscpy(nm, L"(hidden network)");
+                        RECT l1 = {tx, ry, cr.left + DPS(232), ry + DPS(15)};
+                        DrawTextW(mdc, nm, -1, &l1, DT_SINGLELINE | DT_END_ELLIPSIS);
 
                         COLORREF sigCol = n->rssi >= -60 ? C_UP : n->rssi >= -75 ? C_STAT : C_DOWN;
                         WCHAR sig[40];
@@ -1611,6 +1884,7 @@ static void PaintWidget(HWND hwnd)
     DeleteObject(fName);
     DeleteObject(fSub);
     DeleteObject(fScan);
+    DeleteObject(fIcon);
 
     BitBlt(hdc, 0, 0, W, H, mdc, 0, 0, SRCCOPY);
     SelectObject(mdc, obmp);
@@ -1677,6 +1951,28 @@ static BOOL GetScanBarRect(HWND hwnd, RECT *out)
     return FALSE;
 }
 
+/* Index of the scan-result row under client point pt, or -1. Walks cards the
+   same way the painter does so it stays in sync with variable heights. */
+static int ScanRowAt(HWND hwnd, POINT pt)
+{
+    if (!g_scanOpen || g_scanCount <= 0) return -1;   /* mouse msgs only arrive when visible */
+    RECT rc; GetClientRect(hwnd, &rc);
+    if (pt.x < HPAD || pt.x > rc.right - HPAD) return -1;
+    int y = HDR_H + CARD_GAP - g_scrollY;
+    for (int i = 0; i < g_nAd; i++) {
+        if (g_ad[i].state == STATE_DISABLED && !g_showDisabled) continue;
+        const Adapter *a = &g_ad[i];
+        if (IsScanCard(a)) {
+            int ly = y + CARD_H + SCAN_BAR_H + SCAN_PAD;
+            if (pt.y < ly) return -1;
+            int row = (pt.y - ly) / SCAN_ROW_H;
+            return (row >= 0 && row < g_scanCount && pt.y < ly + g_scanCount * SCAN_ROW_H) ? row : -1;
+        }
+        y += CardTotalH(a) + CARD_GAP;
+    }
+    return -1;
+}
+
 static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -1717,6 +2013,21 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             InvalidateRect(hwnd, NULL, TRUE);
             return 0;
 
+        /* Wi-Fi connect attempt finished (wParam = WLAN reason code, 0 = success) */
+        case WM_CONNDONE:
+            if (g_connState != 1) return 0;          /* ignore events we didn't initiate */
+            if (wp == 0 /* WLAN_REASON_CODE_SUCCESS */) {
+                g_connState = 0;                     /* the adapter card + ✓ now reflect it */
+                RefreshAdapters();
+                UpdateTip();
+            } else {
+                g_connState = 2;                     /* show "couldn't connect" briefly */
+                SetTimer(hwnd, TIMER_CONNCLR, 4000, NULL);
+            }
+            PositionWidget();
+            InvalidateRect(hwnd, NULL, TRUE);
+            return 0;
+
         /* Mouse wheel scrolling */
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wp);
@@ -1726,9 +2037,18 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
 
-        /* Click handling: minimize, toggle, or click-to-copy on card row */
+        /* Press a scan row → show the pressed highlight */
+        case WM_LBUTTONDOWN: {
+            POINT pt  = {(short)LOWORD(lp), (short)HIWORD(lp)};
+            int   row = ScanRowAt(hwnd, pt);
+            if (row >= 0) { g_scanRowPress = row; InvalidateRect(hwnd, NULL, FALSE); }
+            return 0;
+        }
+
+        /* Click handling: minimize, toggle, connect to a scanned network, or field-copy */
         case WM_LBUTTONUP: {
             POINT pt   = {(short)LOWORD(lp), (short)HIWORD(lp)};
+            if (g_scanRowPress >= 0) { g_scanRowPress = -1; InvalidateRect(hwnd, NULL, FALSE); }
             RECT  rBtn = GetBtnRect(hwnd);
             RECT  rTog = GetToggleRect(hwnd);
             if (PtInRect(&rBtn, pt)) {
@@ -1767,10 +2087,10 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 int ly = barTop + SCAN_BAR_H + SCAN_PAD;
                                 if (off >= ly) {
                                     int row = (off - ly) / SCAN_ROW_H;
-                                    if (row >= 0 && row < g_scanCount) {
-                                        WCHAR bss[20]; FmtBssid(g_scan[row].bssid, bss, 20);
-                                        CopyToClipboard(bss);   /* click a network → copy its BSSID */
-                                    }
+                                    g_scanRowPress = -1;
+                                    InvalidateRect(hwnd, NULL, FALSE);   /* release the pressed look */
+                                    if (row >= 0 && row < g_scanCount)
+                                        ConnectToScan(row);     /* click a network → connect to it */
                                     return 0;
                                 }
                             }
@@ -1807,10 +2127,12 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             BOOL  hBtn   = PtInRect(&rBtn, pt);
             BOOL  hTog   = g_nDisabled > 0 && PtInRect(&rTog, pt);
             BOOL  hScan  = hasScan && PtInRect(&rScan, pt);
-            if (hBtn != g_btnHover || hTog != g_togHover || hScan != g_scanHover) {
-                g_btnHover  = hBtn;
-                g_togHover  = hTog;
-                g_scanHover = hScan;
+            int   hRow   = ScanRowAt(hwnd, pt);
+            if (hBtn != g_btnHover || hTog != g_togHover || hScan != g_scanHover || hRow != g_scanRowHover) {
+                g_btnHover     = hBtn;
+                g_togHover     = hTog;
+                g_scanHover    = hScan;
+                g_scanRowHover = hRow;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
@@ -1819,8 +2141,9 @@ static LRESULT CALLBACK WidgetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
 
         case WM_MOUSELEAVE:
-            if (g_btnHover || g_togHover || g_scanHover) {
+            if (g_btnHover || g_togHover || g_scanHover || g_scanRowHover >= 0 || g_scanRowPress >= 0) {
                 g_btnHover = g_togHover = g_scanHover = FALSE;
+                g_scanRowHover = g_scanRowPress = -1;
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
